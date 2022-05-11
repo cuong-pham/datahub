@@ -25,6 +25,10 @@ const PreviewContainer = styled.div`
     align-items: center;
 `;
 
+const PreviewWrapper = styled.div`
+    width: 100%;
+`;
+
 const PlatformInfo = styled.div`
     margin-bottom: 8px;
     display: flex;
@@ -33,7 +37,7 @@ const PlatformInfo = styled.div`
 `;
 
 const TitleContainer = styled.div`
-    margin-bottom: 0px;
+    margin-bottom: 5px;
     line-height: 30px;
 `;
 
@@ -78,19 +82,24 @@ const PlatformDivider = styled.div`
 `;
 
 const DescriptionContainer = styled.div`
-    margin-top: 5px;
     color: ${ANTD_GRAY[7]};
 `;
 
 const AvatarContainer = styled.div`
-    margin-top: 12px;
+    margin-top: 6px;
     margin-right: 32px;
 `;
 
 const TagContainer = styled.div`
-    display: inline-block;
+    display: inline-flex;
     margin-left: 0px;
-    margin-top: -2px;
+    margin-top: 5px;
+`;
+
+const TagSeparator = styled.div`
+    margin: 2px 8px 0 0;
+    height: 17px;
+    border-right: 1px solid #cccccc;
 `;
 
 const InsightContainer = styled.div`
@@ -135,6 +144,7 @@ interface Props {
     type?: string;
     typeIcon?: JSX.Element;
     platform?: string;
+    platformInstanceId?: string;
     qualifier?: string | null;
     tags?: GlobalTags;
     owners?: Array<Owner> | null;
@@ -161,6 +171,7 @@ export default function DefaultPreviewCard({
     type,
     typeIcon,
     platform,
+    platformInstanceId,
     // TODO(Gabe): support qualifier in the new preview card
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     qualifier,
@@ -189,19 +200,27 @@ export default function DefaultPreviewCard({
             </>
         )) || []),
     ];
+    const hasGlossaryTerms = !!glossaryTerms?.terms?.length;
+    const hasTags = !!tags?.tags?.length;
     if (snippet) {
         insightViews.push(snippet);
     }
+
     return (
         <PreviewContainer data-testid={dataTestID}>
-            <div>
+            <PreviewWrapper>
                 <TitleContainer>
                     <Link to={url}>
                         <PlatformInfo>
                             {(logoUrl && <PreviewImage preview={false} src={logoUrl} alt={platform || ''} />) || (
                                 <LogoContainer>{logoComponent}</LogoContainer>
                             )}
-                            {platform && <PlatformText>{platform}</PlatformText>}
+                            {platform && (
+                                <PlatformText>
+                                    {platform}
+                                    {platformInstanceId && ` - ${platformInstanceId}`}
+                                </PlatformText>
+                            )}
                             {(logoUrl || logoComponent || platform) && <PlatformDivider />}
                             {typeIcon && <TypeIcon>{typeIcon}</TypeIcon>}
                             <PlatformText>{type}</PlatformText>
@@ -241,19 +260,20 @@ export default function DefaultPreviewCard({
                             {name || ' '}
                         </EntityTitle>
                     </Link>
-                    <TagContainer>
-                        <TagTermGroup
-                            domain={domain}
-                            uneditableGlossaryTerms={glossaryTerms}
-                            uneditableTags={tags}
-                            maxShow={3}
-                        />
-                    </TagContainer>
                 </TitleContainer>
                 {description && description.length > 0 && (
                     <DescriptionContainer>
-                        <NoMarkdownViewer limit={200}>{description}</NoMarkdownViewer>
+                        <NoMarkdownViewer limit={250}>{description}</NoMarkdownViewer>
                     </DescriptionContainer>
+                )}
+                {(domain || hasGlossaryTerms || hasTags) && (
+                    <TagContainer>
+                        <TagTermGroup domain={domain} maxShow={3} />
+                        {domain && hasGlossaryTerms && <TagSeparator />}
+                        <TagTermGroup uneditableGlossaryTerms={glossaryTerms} maxShow={3} />
+                        {((hasGlossaryTerms && hasTags) || (domain && hasTags)) && <TagSeparator />}
+                        <TagTermGroup uneditableTags={tags} maxShow={3} />
+                    </TagContainer>
                 )}
                 {owners && owners.length > 0 && (
                     <AvatarContainer>
@@ -270,7 +290,7 @@ export default function DefaultPreviewCard({
                         ))}
                     </InsightContainer>
                 )}
-            </div>
+            </PreviewWrapper>
         </PreviewContainer>
     );
 }

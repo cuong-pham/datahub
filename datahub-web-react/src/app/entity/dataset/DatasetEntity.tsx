@@ -83,6 +83,7 @@ export class DatasetEntity implements Entity<Dataset> {
             useEntityQuery={useGetDatasetQuery}
             useUpdateQuery={useUpdateDatasetMutation}
             getOverrideProperties={this.getOverridePropertiesFromEntity}
+            showDeprecateOption
             tabs={[
                 {
                     name: 'Schema',
@@ -233,6 +234,7 @@ export class DatasetEntity implements Entity<Dataset> {
                 description={data.editableProperties?.description || data.properties?.description}
                 platformName={data.platform.properties?.displayName || data.platform.name}
                 platformLogo={data.platform.properties?.logoUrl}
+                platformInstanceId={data.dataPlatformInstance?.instanceId}
                 owners={data.ownership?.owners}
                 globalTags={data.globalTags}
                 glossaryTerms={data.glossaryTerms}
@@ -252,6 +254,7 @@ export class DatasetEntity implements Entity<Dataset> {
                 description={data.editableProperties?.description || data.properties?.description}
                 platformName={data.platform.properties?.displayName || data.platform.name}
                 platformLogo={data.platform.properties?.logoUrl}
+                platformInstanceId={data.dataPlatformInstance?.instanceId}
                 owners={data.ownership?.owners}
                 globalTags={data.globalTags}
                 domain={data.domain}
@@ -277,7 +280,7 @@ export class DatasetEntity implements Entity<Dataset> {
         return {
             urn: entity?.urn,
             name: entity?.properties?.name || entity.name,
-            expandedName: entity?.properties?.qualifiedName || entity.name,
+            expandedName: entity?.properties?.qualifiedName || entity?.properties?.name || entity.name,
             type: EntityType.Dataset,
             subtype: entity?.subTypes?.typeNames?.[0] || undefined,
             icon: entity?.platform?.properties?.logoUrl || undefined,

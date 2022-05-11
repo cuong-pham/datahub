@@ -69,6 +69,7 @@ export class ChartEntity implements Entity<Chart> {
             useEntityQuery={useGetChartQuery}
             useUpdateQuery={useUpdateChartMutation}
             getOverrideProperties={this.getOverridePropertiesFromEntity}
+            showDeprecateOption
             tabs={[
                 {
                     name: 'Documentation',
@@ -161,6 +162,7 @@ export class ChartEntity implements Entity<Chart> {
             <ChartPreview
                 urn={data.urn}
                 platform={data.tool}
+                platformInstanceId={data.dataPlatformInstance?.instanceId}
                 name={data.properties?.name}
                 description={data.editableProperties?.description || data.properties?.description}
                 access={data.properties?.access}

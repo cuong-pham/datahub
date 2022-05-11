@@ -1,5 +1,14 @@
 import React, { useState } from 'react';
-import { CheckOutlined, CopyOutlined, FolderOpenOutlined, InfoCircleOutlined, MoreOutlined } from '@ant-design/icons';
+import {
+    CheckOutlined,
+    CopyOutlined,
+    ExclamationCircleOutlined,
+    FolderOpenOutlined,
+    InfoCircleOutlined,
+    LinkOutlined,
+    MoreOutlined,
+    RightOutlined,
+} from '@ant-design/icons';
 import { Typography, Image, Button, Tooltip, Menu, Dropdown, message, Popover } from 'antd';
 import { Link } from 'react-router-dom';
 import styled from 'styled-components';
@@ -11,7 +20,6 @@ import { useEntityRegistry } from '../../../../../useEntityRegistry';
 import { IconStyleType } from '../../../../Entity';
 import { ANTD_GRAY } from '../../../constants';
 import { useEntityData, useRefetch } from '../../../EntityContext';
-import { useEntityPath } from '../utils';
 import analytics, { EventType, EntityActionType } from '../../../../../analytics';
 import { EntityHealthStatus } from './EntityHealthStatus';
 import { useUpdateDeprecationMutation } from '../../../../../../graphql/mutations.generated';
@@ -40,6 +48,7 @@ const PlatformContent = styled.div`
     display: flex;
     align-items: center;
     margin-bottom: 8px;
+    flex-wrap: wrap;
 `;
 
 const PlatformText = styled(Typography.Text)`
@@ -74,10 +83,6 @@ const HeaderContainer = styled.div`
 
 const MainHeaderContent = styled.div`
     flex: 1;
-`;
-
-const ExternalLinkButton = styled(Button)`
-    margin-right: 12px;
 `;
 
 const TypeIcon = styled.span`
@@ -146,7 +151,22 @@ const Divider = styled.div`
     padding-top: 5px;
 `;
 
-export const EntityHeader = () => {
+const SideHeaderContent = styled.div`
+    display: flex;
+    flex-direction: column;
+`;
+
+const TopButtonsWrapper = styled.div`
+    display: flex;
+    justify-content: flex-end;
+    margin-bottom: 8px;
+`;
+
+type Props = {
+    showDeprecateOption?: boolean;
+};
+
+export const EntityHeader = ({ showDeprecateOption }: Props) => {
     const { urn, entityType, entityData } = useEntityData();
     const [updateDeprecation] = useUpdateDeprecationMutation();
     const [showAddDeprecationDetailsModal, setShowAddDeprecationDetailsModal] = useState(false);
@@ -156,11 +176,11 @@ export const EntityHeader = () => {
     const basePlatformName = entityData?.platform?.properties?.displayName || entityData?.platform?.name;
     const platformName = capitalizeFirstLetterOnly(basePlatformName);
     const platformLogoUrl = entityData?.platform?.properties?.logoUrl;
+    const platformInstanceId = entityData?.dataPlatformInstance?.instanceId;
     const entityLogoComponent = entityRegistry.getIcon(entityType, 12, IconStyleType.ACCENT);
     const entityTypeCased =
         (entityData?.subTypes?.typeNames?.length && capitalizeFirstLetterOnly(entityData?.subTypes.typeNames[0])) ||
         entityRegistry.getEntityName(entityType);
-    const entityPath = useEntityPath(entityType, urn);
     const externalUrl = entityData?.externalUrl || undefined;
     const hasExternalUrl = !!externalUrl;
 
@@ -202,18 +222,6 @@ export const EntityHeader = () => {
         refetch?.();
     };
 
-    const menu = (
-        <Menu>
-            <Menu.Item key="0">
-                {!entityData?.deprecation?.deprecated ? (
-                    <MenuItem onClick={() => setShowAddDeprecationDetailsModal(true)}>Mark as deprecated</MenuItem>
-                ) : (
-                    <MenuItem onClick={() => handleUpdateDeprecation(false)}>Mark as un-deprecated</MenuItem>
-                )}
-            </Menu.Item>
-        </Menu>
-    );
-
     /**
      * Deprecation Decommission Timestamp
      */
@@ -232,6 +240,8 @@ export const EntityHeader = () => {
 
     const hasDetails = entityData?.deprecation?.note !== '' || entityData?.deprecation?.decommissionTime !== null;
     const isDividerNeeded = entityData?.deprecation?.note !== '' && entityData?.deprecation?.decommissionTime !== null;
+    const showAdditionalOptions = showDeprecateOption;
+    const pageUrl = window.location.href;
 
     return (
         <>
@@ -246,7 +256,10 @@ export const EntityHeader = () => {
                                     entityLogoComponent}
                             </LogoContainer>
                         )}
-                        <PlatformText>{platformName}</PlatformText>
+                        <PlatformText>
+                            {platformName}
+                            {platformInstanceId && ` - ${platformInstanceId}`}
+                        </PlatformText>
                         {(platformLogoUrl || platformName) && <PlatformDivider />}
                         {typeIcon && <TypeIcon>{typeIcon}</TypeIcon>}
                         <PlatformText>{entityData?.entityTypeOverride || entityTypeCased}</PlatformText>
@@ -271,9 +284,7 @@ export const EntityHeader = () => {
                         ) : null}
                     </PlatformContent>
                     <div style={{ display: 'flex', justifyContent: 'left', alignItems: 'center' }}>
-                        <Link to={entityPath}>
-                            <EntityTitle level={3}>{entityData?.name || ' '}</EntityTitle>
-                        </Link>
+                        <EntityTitle level={3}>{entityData?.name || ' '}</EntityTitle>
                         {entityData?.deprecation?.deprecated && (
                             <Popover
                                 overlayStyle={{ maxWidth: 240 }}
@@ -314,23 +325,57 @@ export const EntityHeader = () => {
                         )}
                     </div>
                 </MainHeaderContent>
-                {hasExternalUrl && (
-                    <ExternalLinkButton href={externalUrl} onClick={sendAnalytics}>
-                        View in {platformName}
-                    </ExternalLinkButton>
-                )}
-                <Tooltip title="Copy URN. An URN uniquely identifies an entity on DataHub.">
-                    <Button
-                        icon={copiedUrn ? <CheckOutlined /> : <CopyOutlined />}
-                        onClick={() => {
-                            navigator.clipboard.writeText(urn);
-                            setCopiedUrn(true);
-                        }}
-                    />
-                </Tooltip>
-                <Dropdown overlay={menu} trigger={['click']}>
-                    <MenuIcon />
-                </Dropdown>
+                <SideHeaderContent>
+                    <TopButtonsWrapper>
+                        <Tooltip title="Copy URN. An URN uniquely identifies an entity on DataHub.">
+                            <Button
+                                icon={copiedUrn ? <CheckOutlined /> : <CopyOutlined />}
+                                onClick={() => {
+                                    navigator.clipboard.writeText(urn);
+                                    setCopiedUrn(true);
+                                }}
+                            />
+                        </Tooltip>
+                        {showAdditionalOptions && (
+                            <Dropdown
+                                overlay={
+                                    <Menu>
+                                        <Menu.Item key="0">
+                                            <MenuItem
+                                                onClick={() => {
+                                                    navigator.clipboard.writeText(pageUrl);
+                                                    message.info('Copied URL!', 1.2);
+                                                }}
+                                            >
+                                                <LinkOutlined /> &nbsp; Copy Url
+                                            </MenuItem>
+                                        </Menu.Item>
+                                        <Menu.Item key="1">
+                                            {!entityData?.deprecation?.deprecated ? (
+                                                <MenuItem onClick={() => setShowAddDeprecationDetailsModal(true)}>
+                                                    <ExclamationCircleOutlined /> &nbsp; Mark as deprecated
+                                                </MenuItem>
+                                            ) : (
+                                                <MenuItem onClick={() => handleUpdateDeprecation(false)}>
+                                                    <ExclamationCircleOutlined /> &nbsp; Mark as un-deprecated
+                                                </MenuItem>
+                                            )}
+                                        </Menu.Item>
+                                    </Menu>
+                                }
+                                trigger={['click']}
+                            >
+                                <MenuIcon />
+                            </Dropdown>
+                        )}
+                    </TopButtonsWrapper>
+                    {hasExternalUrl && (
+                        <Button href={externalUrl} onClick={sendAnalytics}>
+                            View in {platformName}
+                            <RightOutlined style={{ fontSize: 12 }} />
+                        </Button>
+                    )}
+                </SideHeaderContent>
             </HeaderContainer>
             <AddDeprecationDetailsModal
                 visible={showAddDeprecationDetailsModal}
