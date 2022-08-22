@@ -1,10 +1,15 @@
 from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, Generic, Iterable, Optional, Tuple, TypeVar
+from typing import TYPE_CHECKING, Dict, Generic, Iterable, Optional, Tuple, TypeVar
+
+import requests
 
 from datahub.emitter.mce_builder import set_dataset_urn_to_lower
 from datahub.ingestion.api.committable import Committable
 from datahub.ingestion.graph.client import DatahubClientConfig, DataHubGraph
+
+if TYPE_CHECKING:
+    from datahub.ingestion.run.pipeline import PipelineConfig
 
 T = TypeVar("T")
 
@@ -49,14 +54,24 @@ class PipelineContext:
         pipeline_name: Optional[str] = None,
         dry_run: bool = False,
         preview_mode: bool = False,
+        pipeline_config: Optional["PipelineConfig"] = None,
     ) -> None:
+        self.pipeline_config = pipeline_config
         self.run_id = run_id
-        self.graph = DataHubGraph(datahub_api) if datahub_api is not None else None
         self.pipeline_name = pipeline_name
         self.dry_run_mode = dry_run
         self.preview_mode = preview_mode
-        self.reporters: Dict[str, Committable] = dict()
-        self.checkpointers: Dict[str, Committable] = dict()
+        self.reporters: Dict[str, Committable] = {}
+        self.checkpointers: Dict[str, Committable] = {}
+        try:
+            self.graph = DataHubGraph(datahub_api) if datahub_api is not None else None
+        except requests.exceptions.ConnectionError as e:
+            raise Exception("Failed to connect to DataHub") from e
+        except Exception as e:
+            raise Exception(
+                "Failed to instantiate a valid DataHub Graph instance"
+            ) from e
+
         self._set_dataset_urn_to_lower_if_needed()
 
     def _set_dataset_urn_to_lower_if_needed(self) -> None:
@@ -81,11 +96,8 @@ class PipelineContext:
         self.reporters[committable.name] = committable
 
     def get_reporters(self) -> Iterable[Committable]:
-        for committable in self.reporters.values():
-            yield committable
+        yield from self.reporters.values()
 
     def get_committables(self) -> Iterable[Tuple[str, Committable]]:
-        for reporting_item_commitable in self.reporters.items():
-            yield reporting_item_commitable
-        for checkpointing_item_commitable in self.checkpointers.items():
-            yield checkpointing_item_commitable
+        yield from self.reporters.items()
+        yield from self.checkpointers.items()

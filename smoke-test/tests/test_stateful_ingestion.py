@@ -9,6 +9,9 @@ from datahub.ingestion.source.state.checkpoint import Checkpoint
 from sqlalchemy import create_engine
 from sqlalchemy.sql import text
 
+from tests.utils import (get_gms_url, get_mysql_password, get_mysql_url,
+                         get_mysql_username)
+
 
 def test_stateful_ingestion(wait_for_healthchecks):
     def create_mysql_engine(mysql_source_config_dict: Dict[str, Any]) -> Any:
@@ -38,7 +41,7 @@ def test_stateful_ingestion(wait_for_healthchecks):
             stateful_committable = cast(StatefulCommittable, provider)
             assert stateful_committable.has_successfully_committed()
             assert stateful_committable.state_to_commit
-        assert provider_count == 2
+        assert provider_count == 1
 
     def get_current_checkpoint_from_pipeline(
         pipeline: Pipeline,
@@ -49,15 +52,16 @@ def test_stateful_ingestion(wait_for_healthchecks):
         )
 
     source_config_dict: Dict[str, Any] = {
-        "username": "datahub",
-        "password": "datahub",
+        "host_port": get_mysql_url(),
+        "username": get_mysql_username(),
+        "password": get_mysql_password(),
         "database": "datahub",
         "stateful_ingestion": {
             "enabled": True,
             "remove_stale_metadata": True,
             "state_provider": {
                 "type": "datahub",
-                "config": {"datahub_api": {"server": "http://localhost:8080"}},
+                "config": {"datahub_api": {"server": get_gms_url()}},
             },
         },
     }
@@ -69,13 +73,13 @@ def test_stateful_ingestion(wait_for_healthchecks):
         },
         "sink": {
             "type": "datahub-rest",
-            "config": {"server": "http://localhost:8080"},
+            "config": {"server": get_gms_url()},
         },
         "pipeline_name": "mysql_stateful_ingestion_smoke_test_pipeline",
         "reporting": [
             {
                 "type": "datahub",
-                "config": {"datahub_api": {"server": "http://localhost:8080"}},
+                "config": {"datahub_api": {"server": get_gms_url()}},
             }
         ],
     }

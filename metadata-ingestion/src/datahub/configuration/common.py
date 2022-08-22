@@ -1,14 +1,37 @@
 import re
 from abc import ABC, abstractmethod
-from typing import IO, Any, Dict, List, Optional, Pattern, cast
+from enum import Enum
+from typing import IO, Any, ClassVar, Dict, List, Optional, Pattern, cast
 
-from pydantic import BaseModel
+from cached_property import cached_property
+from pydantic import BaseModel, Extra, validator
 from pydantic.fields import Field
 
 
 class ConfigModel(BaseModel):
     class Config:
-        extra = "forbid"
+        extra = Extra.forbid
+        underscore_attrs_are_private = True
+        keep_untouched = (
+            cached_property,
+        )  # needed to allow cached_property to work. See https://github.com/samuelcolvin/pydantic/issues/1241 for more info.
+
+
+class TransformerSemantics(Enum):
+    """Describes semantics for aspect changes"""
+
+    OVERWRITE = "OVERWRITE"  # Apply changes blindly
+    PATCH = "PATCH"  # Only apply differences from what exists already on the server
+
+
+class TransformerSemanticsConfigModel(ConfigModel):
+    semantics: TransformerSemantics = TransformerSemantics.OVERWRITE
+
+    @validator("semantics", pre=True)
+    def ensure_semantics_is_upper_case(cls, v: str) -> str:
+        if isinstance(v, str):
+            return v.upper()
+        return v
 
 
 class DynamicTypedConfig(ConfigModel):
@@ -39,10 +62,7 @@ class OperationalError(PipelineExecutionError):
 
     def __init__(self, message: str, info: dict = None):
         self.message = message
-        if info:
-            self.info = info
-        else:
-            self.info = {}
+        self.info = info or {}
 
 
 class ConfigurationError(MetaError):
@@ -106,32 +126,28 @@ class OauthConfiguration(ConfigModel):
 class AllowDenyPattern(ConfigModel):
     """A class to store allow deny regexes"""
 
+    # This regex is used to check if a given rule is a regex expression or a literal.
+    # Note that this is not a perfect check. For example, the '.' character should
+    # be considered a regex special character, but it's used frequently in literal
+    # patterns and hence we allow it anyway.
+    IS_SIMPLE_REGEX: ClassVar = re.compile(r"^[A-Za-z0-9 _.-]+$")
+
     allow: List[str] = Field(
         default=[".*"],
-        description="List of regex patterns for process groups to include in ingestion",
+        description="List of regex patterns to include in ingestion",
     )
     deny: List[str] = Field(
         default=[],
-        description="List of regex patterns for process groups to exclude from ingestion.",
+        description="List of regex patterns to exclude from ingestion.",
     )
     ignoreCase: Optional[bool] = Field(
         default=True,
         description="Whether to ignore case sensitivity during pattern matching.",
     )  # Name comparisons should default to ignoring case
-    alphabet: str = Field(
-        default="[A-Za-z0-9 _.-]", description="Allowed alphabets pattern"
-    )
-
-    @property
-    def alphabet_pattern(self) -> Pattern:
-        return re.compile(f"^{self.alphabet}+$")
 
     @property
     def regex_flags(self) -> int:
-        if self.ignoreCase:
-            return re.IGNORECASE
-        else:
-            return 0
+        return re.IGNORECASE if self.ignoreCase else 0
 
     @classmethod
     def allow_all(cls) -> "AllowDenyPattern":
@@ -142,11 +158,10 @@ class AllowDenyPattern(ConfigModel):
             if re.match(deny_pattern, string, self.regex_flags):
                 return False
 
-        for allow_pattern in self.allow:
-            if re.match(allow_pattern, string, self.regex_flags):
-                return True
-
-        return False
+        return any(
+            re.match(allow_pattern, string, self.regex_flags)
+            for allow_pattern in self.allow
+        )
 
     def is_fully_specified_allow_list(self) -> bool:
         """
@@ -155,10 +170,9 @@ class AllowDenyPattern(ConfigModel):
         pattern into a 'search for the ones that are allowed' pattern, which can be
         much more efficient in some cases.
         """
-        for allow_pattern in self.allow:
-            if not self.alphabet_pattern.match(allow_pattern):
-                return False
-        return True
+        return all(
+            self.IS_SIMPLE_REGEX.match(allow_pattern) for allow_pattern in self.allow
+        )
 
     def get_allowed_list(self) -> List[str]:
         """Return the list of allowed strings as a list, after taking into account deny patterns, if possible"""
@@ -181,16 +195,12 @@ class KeyValuePattern(ConfigModel):
         return KeyValuePattern()
 
     def value(self, string: str) -> List[str]:
-        for key in self.rules.keys():
-            if re.match(key, string):
-                return self.rules[key]
-        return []
+        return next(
+            (self.rules[key] for key in self.rules.keys() if re.match(key, string)), []
+        )
 
     def matched(self, string: str) -> bool:
-        for key in self.rules.keys():
-            if re.match(key, string):
-                return True
-        return False
+        return any(re.match(key, string) for key in self.rules.keys())
 
     def is_fully_specified_key(self) -> bool:
         """
@@ -199,10 +209,7 @@ class KeyValuePattern(ConfigModel):
         pattern into a 'search for the ones that are allowed' pattern, which can be
         much more efficient in some cases.
         """
-        for key in self.rules.keys():
-            if not self.alphabet_pattern.match(key):
-                return True
-        return False
+        return any(not self.alphabet_pattern.match(key) for key in self.rules.keys())
 
     def get(self) -> Dict[str, List[str]]:
         """Return the list of allowed strings as a list, after taking into account deny patterns, if possible"""

@@ -26,7 +26,7 @@ from datahub.utilities.server_config_util import get_gms_config
 logger = logging.getLogger(__name__)
 
 # Configure some loggers.
-logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
 logging.getLogger("snowflake").setLevel(level=logging.WARNING)
 # logging.getLogger("botocore").setLevel(logging.INFO)
 # logging.getLogger("google").setLevel(logging.INFO)
@@ -164,20 +164,53 @@ def main(**kwargs):
         if isinstance(exc, (ConfigurationError, ValidationError)):
             logger.error(exc)
         else:
-            logger.error(
+            # only print stacktraces during debug
+            logger.debug(
                 stackprinter.format(
                     exc,
                     line_wrap=MAX_CONTENT_WIDTH,
                     truncate_vals=10 * MAX_CONTENT_WIDTH,
+                    suppressed_vars=[
+                        r".*password.*",
+                        r".*secret.*",
+                        r".*key.*",
+                        r".*access.*",
+                        # needed because sometimes secrets are in url
+                        r".*url.*",
+                        # needed because sqlalchemy uses it underneath
+                        # and passes all params
+                        r".*cparams.*",
+                    ],
                     suppressed_paths=[r"lib/python.*/site-packages/click/"],
                     **kwargs,
                 )
             )
-        logger.info(
+
+            if "--debug" not in sys.argv:
+                pretty_msg = _get_pretty_chained_message(exc)
+                # log the exception with a basic traceback
+                logger.exception(msg="", exc_info=exc)
+                debug_variant_command = " ".join(["datahub", "--debug"] + sys.argv[1:])
+                # log a more human readable message at the very end
+                logger.error(
+                    f"Command failed: \n\t{pretty_msg}.\n\tRun with --debug to get full stacktrace.\n\te.g. '{debug_variant_command}'"
+                )
+        logger.debug(
             f"DataHub CLI version: {datahub_package.__version__} at {datahub_package.__file__}"
         )
-        logger.info(
+        logger.debug(
             f"Python version: {sys.version} at {sys.executable} on {platform.platform()}"
         )
-        logger.info(f"GMS config {get_gms_config()}")
+        logger.debug(f"GMS config {get_gms_config()}")
         sys.exit(1)
+
+
+def _get_pretty_chained_message(exc: Exception) -> str:
+    pretty_msg = f"{exc}"
+    tmp_exc = exc.__cause__
+    indent = "\n\t\t"
+    while tmp_exc:
+        pretty_msg = f"{pretty_msg} due to {indent}'{tmp_exc}'"
+        tmp_exc = tmp_exc.__cause__
+        indent += "\t"
+    return pretty_msg

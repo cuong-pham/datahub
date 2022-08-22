@@ -54,7 +54,7 @@ Make sure yaml plugin is installed for your editor:
 :::
 
 Since `acryl-datahub` version `>=0.8.33.2`, the default sink is assumed to be a DataHub REST endpoint:
-- Hosted at "http://localhost:8080" or the environment variable `${DATAHUB_GMS_HOST}` if present
+- Hosted at "http://localhost:8080" or the environment variable `${DATAHUB_GMS_URL}` if present
 - With an empty auth token or the environment variable `${DATAHUB_GMS_TOKEN}` if present. 
 
 Here's a simple recipe that pulls metadata from MSSQL (source) and puts it into the default sink (datahub rest).
@@ -79,7 +79,7 @@ datahub ingest -c recipe.dhub.yaml
 
 or if you want to override the default endpoints, you can provide the environment variables as part of the command like below:
 ```shell
-DATAHUB_GMS_HOST="https://my-datahub-server:8080" DATAHUB_GMS_TOKEN="my-datahub-token" datahub ingest -c recipe.dhub.yaml
+DATAHUB_GMS_URL="https://my-datahub-server:8080" DATAHUB_GMS_TOKEN="my-datahub-token" datahub ingest -c recipe.dhub.yaml
 ```
 
 A number of recipes are included in the [examples/recipes](./examples/recipes) directory. For full info and context on each source and sink, see the pages described in the [table of plugins](../docs/cli.md#installing-plugins).
@@ -132,6 +132,33 @@ Sometimes, while running the ingestion pipeline, unexpected exceptions may occur
 # Running ingestion with --suppress-error-logs option
 datahub ingest -c ./examples/recipes/example_to_datahub_rest.dhub.yml --suppress-error-logs
 ```
+
+#### Reporting
+
+By default, the cli sends an ingestion report to DataHub, which allows you to see the result of all cli-based ingestion in the UI. This can be turned off with the `--no-default-report` flag.
+
+```shell
+# Running ingestion with reporting to DataHub turned off
+datahub ingest -c ./examples/recipes/example_to_datahub_rest.dhub.yaml --no-default-report
+```
+
+The reports include the recipe that was used for ingestion. This can be turned off by adding an additional section to the ingestion recipe.
+
+```yaml
+
+source:
+   # source configs
+
+sink:
+   # sink configs
+
+# Add configuration for the datahub reporter
+reporting:
+  - type: datahub
+    config:
+      report_recipe: false
+```
+
 
 ## Transformations
 

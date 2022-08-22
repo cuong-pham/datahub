@@ -1,28 +1,27 @@
-import datetime
 import itertools
 import logging
-import uuid
+import platform
+import sys
+import time
+from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional
 
 import click
-from pydantic import root_validator, validator
 
-from datahub.configuration import config_loader
-from datahub.configuration.common import (
-    ConfigModel,
-    DynamicTypedConfig,
-    PipelineExecutionError,
-)
+import datahub
+from datahub.configuration.common import PipelineExecutionError
 from datahub.ingestion.api.committable import CommitPolicy
 from datahub.ingestion.api.common import EndOfStream, PipelineContext, RecordEnvelope
+from datahub.ingestion.api.pipeline_run_listener import PipelineRunListener
+from datahub.ingestion.api.report import Report
 from datahub.ingestion.api.sink import Sink, WriteCallback
 from datahub.ingestion.api.source import Extractor, Source
 from datahub.ingestion.api.transform import Transformer
 from datahub.ingestion.extractor.extractor_registry import extractor_registry
-from datahub.ingestion.graph.client import DatahubClientConfig
 from datahub.ingestion.reporting.reporting_provider_registry import (
     reporting_provider_registry,
 )
+from datahub.ingestion.run.pipeline_config import PipelineConfig, ReporterConfig
 from datahub.ingestion.sink.sink_registry import sink_registry
 from datahub.ingestion.source.source_registry import source_registry
 from datahub.ingestion.transformer.transform_registry import transform_registry
@@ -31,75 +30,11 @@ from datahub.telemetry import stats, telemetry
 logger = logging.getLogger(__name__)
 
 
-class SourceConfig(DynamicTypedConfig):
-    extractor: str = "generic"
-
-
-class PipelineConfig(ConfigModel):
-    # Once support for discriminated unions gets merged into Pydantic, we can
-    # simplify this configuration and validation.
-    # See https://github.com/samuelcolvin/pydantic/pull/2336.
-
-    source: SourceConfig
-    sink: DynamicTypedConfig
-    transformers: Optional[List[DynamicTypedConfig]]
-    reporting: Optional[List[DynamicTypedConfig]] = None
-    run_id: str = "__DEFAULT_RUN_ID"
-    datahub_api: Optional[DatahubClientConfig] = None
-    pipeline_name: Optional[str] = None
-
-    @validator("run_id", pre=True, always=True)
-    def run_id_should_be_semantic(
-        cls, v: Optional[str], values: Dict[str, Any], **kwargs: Any
-    ) -> str:
-        if v == "__DEFAULT_RUN_ID":
-            if "source" in values:
-                if hasattr(values["source"], "type"):
-                    source_type = values["source"].type
-                    current_time = datetime.datetime.now().strftime("%Y_%m_%d-%H_%M_%S")
-                    return f"{source_type}-{current_time}"
-
-            return str(uuid.uuid1())  # default run_id if we cannot infer a source type
-        else:
-            assert v is not None
-            return v
-
-    @root_validator(pre=True)
-    def default_sink_is_datahub_rest(cls, values: Dict[str, Any]) -> Any:
-        if "sink" not in values:
-            default_sink_config = {
-                "type": "datahub-rest",
-                "config": {
-                    "server": "${DATAHUB_GMS_HOST:-http://localhost:8080}",
-                    "token": "${DATAHUB_GMS_TOKEN:-}",
-                },
-            }
-            # resolve env variables if present
-            default_sink_config = config_loader.resolve_env_variables(
-                default_sink_config
-            )
-            values["sink"] = default_sink_config
-
-        return values
-
-    @validator("datahub_api", always=True)
-    def datahub_api_should_use_rest_sink_as_default(
-        cls, v: Optional[DatahubClientConfig], values: Dict[str, Any], **kwargs: Any
-    ) -> Optional[DatahubClientConfig]:
-        if v is None:
-            if "sink" in values and hasattr(values["sink"], "type"):
-                sink_type = values["sink"].type
-                if sink_type == "datahub-rest":
-                    sink_config = values["sink"].config
-                    v = DatahubClientConfig.parse_obj(sink_config)
-        return v
-
-
 class LoggingCallback(WriteCallback):
     def on_success(
         self, record_envelope: RecordEnvelope, success_metadata: dict
     ) -> None:
-        logger.info(f"sink wrote workunit {record_envelope.metadata['workunit_id']}")
+        logger.debug(f"sink wrote workunit {record_envelope.metadata['workunit_id']}")
 
     def on_failure(
         self,
@@ -113,6 +48,19 @@ class LoggingCallback(WriteCallback):
         )
 
 
+class PipelineInitError(Exception):
+    pass
+
+
+@dataclass
+class CliReport(Report):
+    cli_version: str = datahub.nice_version_name()
+    cli_entry_location: str = datahub.__file__
+    py_version: str = sys.version
+    py_exec_path: str = sys.executable
+    os_details: str = platform.platform()
+
+
 class Pipeline:
     config: PipelineConfig
     ctx: PipelineContext
@@ -120,42 +68,97 @@ class Pipeline:
     sink: Sink
     transformers: List[Transformer]
 
+    def _record_initialization_failure(self, e: Exception, msg: str) -> None:
+        raise PipelineInitError(msg) from e
+
     def __init__(
         self,
         config: PipelineConfig,
         dry_run: bool = False,
         preview_mode: bool = False,
         preview_workunits: int = 10,
+        report_to: Optional[str] = None,
+        no_default_report: bool = False,
     ):
         self.config = config
         self.dry_run = dry_run
         self.preview_mode = preview_mode
         self.preview_workunits = preview_workunits
-        self.ctx = PipelineContext(
-            run_id=self.config.run_id,
-            datahub_api=self.config.datahub_api,
-            pipeline_name=self.config.pipeline_name,
-            dry_run=dry_run,
-            preview_mode=preview_mode,
-        )
+        self.report_to = report_to
+        self.reporters: List[PipelineRunListener] = []
+        self.num_intermediate_workunits = 0
+        self.last_time_printed = int(time.time())
+        self.cli_report = CliReport()
+
+        try:
+            self.ctx = PipelineContext(
+                run_id=self.config.run_id,
+                datahub_api=self.config.datahub_api,
+                pipeline_name=self.config.pipeline_name,
+                dry_run=dry_run,
+                preview_mode=preview_mode,
+                pipeline_config=self.config,
+            )
+        except Exception as e:
+            self._record_initialization_failure(e, "Failed to set up framework context")
 
         sink_type = self.config.sink.type
-        sink_class = sink_registry.get(sink_type)
-        sink_config = self.config.sink.dict().get("config") or {}
-        self.sink: Sink = sink_class.create(sink_config, self.ctx)
-        logger.debug(f"Sink type:{self.config.sink.type},{sink_class} configured")
+        try:
+            sink_class = sink_registry.get(sink_type)
+        except Exception as e:
+            self._record_initialization_failure(
+                e, f"Failed to find a registered sink for type {sink_type}"
+            )
+            return
 
-        source_type = self.config.source.type
-        source_class = source_registry.get(source_type)
-        self.source: Source = source_class.create(
-            self.config.source.dict().get("config", {}), self.ctx
-        )
-        logger.debug(f"Source type:{source_type},{source_class} configured")
+        try:
+            sink_config = self.config.sink.dict().get("config") or {}
+            self.sink: Sink = sink_class.create(sink_config, self.ctx)
+            logger.debug(f"Sink type:{self.config.sink.type},{sink_class} configured")
+            logger.info(f"Sink configured successfully. {self.sink.configured()}")
+        except Exception as e:
+            self._record_initialization_failure(
+                e, f"Failed to configure sink ({sink_type})"
+            )
 
-        self.extractor_class = extractor_registry.get(self.config.source.extractor)
+        # once a sink is configured, we can configure reporting immediately to get observability
+        try:
+            self._configure_reporting(report_to, no_default_report)
+        except Exception as e:
+            self._record_initialization_failure(e, "Failed to configure reporters")
+            return
 
-        self._configure_transforms()
-        self._configure_reporting()
+        try:
+            source_type = self.config.source.type
+            source_class = source_registry.get(source_type)
+        except Exception as e:
+            self._record_initialization_failure(e, "Failed to create source")
+            return
+
+        try:
+            self.source: Source = source_class.create(
+                self.config.source.dict().get("config", {}), self.ctx
+            )
+            logger.debug(f"Source type:{source_type},{source_class} configured")
+        except Exception as e:
+            self._record_initialization_failure(
+                e, f"Failed to configure source ({source_type})"
+            )
+            return
+
+        try:
+            self.extractor_class = extractor_registry.get(self.config.source.extractor)
+        except Exception as e:
+            self._record_initialization_failure(
+                e, f"Failed to configure extractor ({self.config.source.extractor})"
+            )
+            return
+
+        try:
+            self._configure_transforms()
+        except ValueError as e:
+            self._record_initialization_failure(e, "Failed to configure transformers")
+            return
 
     def _configure_transforms(self) -> None:
         self.transformers = []
@@ -171,24 +174,68 @@ class Pipeline:
                     f"Transformer type:{transformer_type},{transformer_class} configured"
                 )
 
-    def _configure_reporting(self) -> None:
-        if self.config.reporting is None:
-            return
+    def _configure_reporting(
+        self, report_to: Optional[str], no_default_report: bool
+    ) -> None:
+        if report_to == "datahub":
+            # we add the default datahub reporter unless a datahub reporter is already configured
+            if not no_default_report and (
+                not self.config.reporting
+                or "datahub" not in [x.type for x in self.config.reporting]
+            ):
+                self.config.reporting.append(
+                    ReporterConfig.parse_obj({"type": "datahub"})
+                )
+        elif report_to:
+            # we assume this is a file name, and add the file reporter
+            self.config.reporting.append(
+                ReporterConfig.parse_obj(
+                    {"type": "file", "config": {"filename": report_to}}
+                )
+            )
 
         for reporter in self.config.reporting:
             reporter_type = reporter.type
             reporter_class = reporting_provider_registry.get(reporter_type)
             reporter_config_dict = reporter.dict().get("config", {})
-            self.ctx.register_reporter(
-                reporter_class.create(
-                    config_dict=reporter_config_dict,
-                    ctx=self.ctx,
-                    name=reporter_class.__name__,
+            try:
+                self.reporters.append(
+                    reporter_class.create(
+                        config_dict=reporter_config_dict,
+                        ctx=self.ctx,
+                    )
                 )
-            )
-            logger.debug(
-                f"Transformer type:{reporter_type},{reporter_class} configured"
-            )
+                logger.debug(
+                    f"Reporter type:{reporter_type},{reporter_class} configured."
+                )
+            except Exception as e:
+                if reporter.required:
+                    raise
+                else:
+                    logger.warning(
+                        f"Failed to configure reporter: {reporter_type}", exc_info=e
+                    )
+
+    def _notify_reporters_on_ingestion_start(self) -> None:
+        for reporter in self.reporters:
+            try:
+                reporter.on_start(ctx=self.ctx)
+            except Exception as e:
+                logger.warning("Reporting failed on start", exc_info=e)
+
+    def _notify_reporters_on_ingestion_completion(self) -> None:
+        for reporter in self.reporters:
+            try:
+                reporter.on_completion(
+                    status="FAILURE"
+                    if self.source.get_report().failures
+                    or self.sink.get_report().failures
+                    else "SUCCESS",
+                    report=self._get_structured_report(),
+                    ctx=self.ctx,
+                )
+            except Exception as e:
+                logger.warning("Reporting failed on completion", exc_info=e)
 
     @classmethod
     def create(
@@ -197,53 +244,79 @@ class Pipeline:
         dry_run: bool = False,
         preview_mode: bool = False,
         preview_workunits: int = 10,
+        report_to: Optional[str] = None,
+        no_default_report: bool = False,
+        raw_config: Optional[dict] = None,
     ) -> "Pipeline":
-        config = PipelineConfig.parse_obj(config_dict)
+        config = PipelineConfig.from_dict(config_dict, raw_config)
         return cls(
             config,
             dry_run=dry_run,
             preview_mode=preview_mode,
             preview_workunits=preview_workunits,
+            report_to=report_to,
+            no_default_report=no_default_report,
         )
+
+    def _time_to_print(self) -> bool:
+        self.num_intermediate_workunits += 1
+        if self.num_intermediate_workunits > 1000:
+            current_time = int(time.time())
+            if current_time - self.last_time_printed > 10:
+                # we print
+                self.num_intermediate_workunits = 0
+                self.last_time_printed = current_time
+                return True
+        return False
 
     def run(self) -> None:
 
-        callback = LoggingCallback()
-        extractor: Extractor = self.extractor_class()
-        for wu in itertools.islice(
-            self.source.get_workunits(),
-            self.preview_workunits if self.preview_mode else None,
-        ):
-            # TODO: change extractor interface
-            extractor.configure({}, self.ctx)
+        self._notify_reporters_on_ingestion_start()
+        try:
+            callback = LoggingCallback()
+            extractor: Extractor = self.extractor_class()
+            for wu in itertools.islice(
+                self.source.get_workunits(),
+                self.preview_workunits if self.preview_mode else None,
+            ):
+                if self._time_to_print():
+                    self.pretty_print_summary(currently_running=True)
+                # TODO: change extractor interface
+                extractor.configure({}, self.ctx)
 
-            if not self.dry_run:
-                self.sink.handle_work_unit_start(wu)
-            try:
-                record_envelopes = extractor.get_records(wu)
-                for record_envelope in self.transform(record_envelopes):
-                    if not self.dry_run:
-                        self.sink.write_record_async(record_envelope, callback)
-            except Exception as e:
-                logger.error(f"Failed to extract some records due to: {e}")
-            extractor.close()
-            if not self.dry_run:
-                self.sink.handle_work_unit_end(wu)
-        self.source.close()
-        # no more data is coming, we need to let the transformers produce any additional records if they are holding on to state
-        for record_envelope in self.transform(
-            [
-                RecordEnvelope(
-                    record=EndOfStream(), metadata={"workunit_id": "end-of-stream"}
-                )
-            ]
-        ):
-            if not self.dry_run and not isinstance(record_envelope.record, EndOfStream):
-                # TODO: propagate EndOfStream and other control events to sinks, to allow them to flush etc.
-                self.sink.write_record_async(record_envelope, callback)
+                if not self.dry_run:
+                    self.sink.handle_work_unit_start(wu)
+                try:
+                    record_envelopes = extractor.get_records(wu)
+                    for record_envelope in self.transform(record_envelopes):
+                        if not self.dry_run:
+                            self.sink.write_record_async(record_envelope, callback)
 
-        self.sink.close()
-        self.process_commits()
+                except Exception as e:
+                    logger.error(f"Failed to extract some records due to: {e}")
+
+                extractor.close()
+                if not self.dry_run:
+                    self.sink.handle_work_unit_end(wu)
+            self.source.close()
+            # no more data is coming, we need to let the transformers produce any additional records if they are holding on to state
+            for record_envelope in self.transform(
+                [
+                    RecordEnvelope(
+                        record=EndOfStream(), metadata={"workunit_id": "end-of-stream"}
+                    )
+                ]
+            ):
+                if not self.dry_run and not isinstance(
+                    record_envelope.record, EndOfStream
+                ):
+                    # TODO: propagate EndOfStream and other control events to sinks, to allow them to flush etc.
+                    self.sink.write_record_async(record_envelope, callback)
+
+            self.sink.close()
+            self.process_commits()
+        finally:
+            self._notify_reporters_on_ingestion_completion()
 
     def transform(self, records: Iterable[RecordEnvelope]) -> Iterable[RecordEnvelope]:
         """
@@ -266,11 +339,10 @@ class Pipeline:
             if self.source.get_report().failures or self.sink.get_report().failures
             else False
         )
-        has_warnings: bool = (
-            True
-            if self.source.get_report().warnings or self.sink.get_report().warnings
-            else False
+        has_warnings: bool = bool(
+            self.source.get_report().warnings or self.sink.get_report().warnings
         )
+
         for name, committable in self.ctx.get_committables():
             commit_policy: CommitPolicy = committable.commit_policy
 
@@ -311,7 +383,6 @@ class Pipeline:
             )
 
     def log_ingestion_stats(self) -> None:
-
         telemetry.telemetry_instance.ping(
             "ingest_stats",
             {
@@ -330,8 +401,12 @@ class Pipeline:
             result += len(val)
         return result
 
-    def pretty_print_summary(self, warnings_as_failure: bool = False) -> int:
+    def pretty_print_summary(
+        self, warnings_as_failure: bool = False, currently_running: bool = False
+    ) -> int:
         click.echo()
+        click.secho("Cli report:", bold=True)
+        click.secho(self.cli_report.as_string())
         click.secho(f"Source ({self.config.source.type}) report:", bold=True)
         click.echo(self.source.get_report().as_string())
         click.secho(f"Sink ({self.config.sink.type}) report:", bold=True)
@@ -343,7 +418,7 @@ class Pipeline:
                 self.source.get_report().failures
             )
             click.secho(
-                f"Pipeline finished with {num_failures_source} failures in source producing {workunits_produced} workunits",
+                f"{'⏳' if currently_running else ''} Pipeline {'running' if currently_running else 'finished'} with {num_failures_source} failures {'so far' if currently_running else ''}; produced {workunits_produced} events",
                 fg="bright_red",
                 bold=True,
             )
@@ -351,15 +426,27 @@ class Pipeline:
         elif self.source.get_report().warnings or self.sink.get_report().warnings:
             num_warn_source = self._count_all_vals(self.source.get_report().warnings)
             click.secho(
-                f"Pipeline finished with {num_warn_source} warnings in source producing {workunits_produced} workunits",
+                f"{'⏳' if currently_running else ''} Pipeline {'running' if currently_running else 'finished'} with {num_warn_source} warnings {'so far' if currently_running else ''}; produced {workunits_produced} events",
                 fg="yellow",
                 bold=True,
             )
             return 1 if warnings_as_failure else 0
         else:
             click.secho(
-                f"Pipeline finished successfully producing {workunits_produced} workunits",
+                f"{'⏳' if currently_running else ''} Pipeline {'running' if currently_running else 'finished'} successfully {'so far' if currently_running else ''}; produced {workunits_produced} events",
                 fg="green",
                 bold=True,
             )
             return 0
+
+    def _get_structured_report(self) -> Dict[str, Any]:
+        return {
+            "source": {
+                "type": self.config.source.type,
+                "report": self.source.get_report().as_obj(),
+            },
+            "sink": {
+                "type": self.config.sink.type,
+                "report": self.sink.get_report().as_obj(),
+            },
+        }
