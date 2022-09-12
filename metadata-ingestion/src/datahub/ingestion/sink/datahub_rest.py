@@ -5,16 +5,17 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import timedelta
+from enum import Enum
 from threading import BoundedSemaphore
 from typing import Union, cast
 
-from tdigest import TDigest
+from pydantic import validator
 
 from datahub.cli.cli_utils import set_env_variables_override_config
 from datahub.configuration.common import ConfigurationError, OperationalError
 from datahub.emitter.mcp import MetadataChangeProposalWrapper
 from datahub.emitter.rest_emitter import DatahubRestEmitter
-from datahub.ingestion.api.common import PipelineContext, RecordEnvelope, WorkUnit
+from datahub.ingestion.api.common import RecordEnvelope, WorkUnit
 from datahub.ingestion.api.sink import Sink, SinkReport, WriteCallback
 from datahub.ingestion.api.workunit import MetadataWorkUnit
 from datahub.ingestion.graph.client import DatahubClientConfig
@@ -28,25 +29,31 @@ from datahub.utilities.server_config_util import set_gms_config
 logger = logging.getLogger(__name__)
 
 
+class SyncOrAsync(Enum):
+    SYNC = "SYNC"
+    ASYNC = "ASYNC"
+
+
 class DatahubRestSinkConfig(DatahubClientConfig):
-    max_pending_requests = 1000
+    max_pending_requests: int = 1000
+    mode: SyncOrAsync = SyncOrAsync.ASYNC
+
+    @validator("mode", pre=True)
+    def str_to_enum_value(cls, v):
+        if v and isinstance(v, str):
+            return v.upper()
 
 
 @dataclass
 class DataHubRestSinkReport(SinkReport):
     gms_version: str = ""
     pending_requests: int = 0
-    _digest = TDigest()
 
     def compute_stats(self) -> None:
         super().compute_stats()
-        self.ninety_fifth_percentile_write_latency_in_millis = self._digest.percentile(
-            95
-        )
-        self.fiftieth_percentile_write_latency_in_millis = self._digest.percentile(50)
 
     def report_write_latency(self, delta: timedelta) -> None:
-        self._digest.update(round(delta.total_seconds() * 1000.0))
+        pass
 
 
 class BoundedExecutor:
@@ -80,17 +87,11 @@ class BoundedExecutor:
         self.executor.shutdown(wait)
 
 
-@dataclass
-class DatahubRestSink(Sink):
-    config: DatahubRestSinkConfig
+class DatahubRestSink(Sink[DatahubRestSinkConfig, DataHubRestSinkReport]):
     emitter: DatahubRestEmitter
-    report: DataHubRestSinkReport
     treat_errors_as_warnings: bool = False
 
-    def __init__(self, ctx: PipelineContext, config: DatahubRestSinkConfig):
-        super().__init__(ctx)
-        self.config = config
-        self.report = DataHubRestSinkReport()
+    def __post_init__(self) -> None:
         self.emitter = DatahubRestEmitter(
             self.config.server,
             self.config.token,
@@ -124,11 +125,6 @@ class DatahubRestSink(Sink):
             bound=self.config.max_pending_requests,
         )
 
-    @classmethod
-    def create(cls, config_dict: dict, ctx: PipelineContext) -> "DatahubRestSink":
-        config = DatahubRestSinkConfig.parse_obj(config_dict)
-        return cls(ctx, config)
-
     def handle_work_unit_start(self, workunit: WorkUnit) -> None:
         if isinstance(workunit, MetadataWorkUnit):
             mwu: MetadataWorkUnit = cast(MetadataWorkUnit, workunit)
@@ -158,24 +154,28 @@ class DatahubRestSink(Sink):
                 write_callback.on_success(record_envelope, {})
             elif isinstance(e, OperationalError):
                 # only OperationalErrors should be ignored
+                # trim exception stacktraces in all cases when reporting
+                if "stackTrace" in e.info:
+                    with contextlib.suppress(Exception):
+                        e.info["stackTrace"] = "\n".join(
+                            e.info["stackTrace"].split("\n")[:3]
+                        )
+                        e.info["message"] = e.info.get("message", "").split("\n")[0][
+                            :200
+                        ]
+
+                # Include information about the entity that failed.
+                record = record_envelope.record
+                if isinstance(record, MetadataChangeProposalWrapper):
+                    entity_id = record.entityUrn
+                    e.info["id"] = entity_id
+                elif isinstance(record, MetadataChangeEvent):
+                    entity_id = record.proposedSnapshot.urn
+                    e.info["id"] = entity_id
+
                 if not self.treat_errors_as_warnings:
                     self.report.report_failure({"error": e.message, "info": e.info})
                 else:
-                    # trim exception stacktraces when reporting warnings
-                    if "stackTrace" in e.info:
-                        with contextlib.suppress(Exception):
-                            e.info["stackTrace"] = "\n".join(
-                                e.info["stackTrace"].split("\n")[:2]
-                            )
-                    record = record_envelope.record
-                    if isinstance(record, MetadataChangeProposalWrapper):
-                        # include information about the entity that failed
-                        entity_id = cast(
-                            MetadataChangeProposalWrapper, record
-                        ).entityUrn
-                        e.info["id"] = entity_id
-                    else:
-                        entity_id = None
                     self.report.report_warning({"warning": e.message, "info": e.info})
                 write_callback.on_failure(record_envelope, e, e.info)
             else:
@@ -195,16 +195,21 @@ class DatahubRestSink(Sink):
         write_callback: WriteCallback,
     ) -> None:
         record = record_envelope.record
-        write_future = self.executor.submit(self.emitter.emit, record)
-        write_future.add_done_callback(
-            functools.partial(
-                self._write_done_callback, record_envelope, write_callback
+        if self.config.mode == SyncOrAsync.ASYNC:
+            write_future = self.executor.submit(self.emitter.emit, record)
+            write_future.add_done_callback(
+                functools.partial(
+                    self._write_done_callback, record_envelope, write_callback
+                )
             )
-        )
-        self.report.pending_requests += 1
-
-    def get_report(self) -> SinkReport:
-        return self.report
+            self.report.pending_requests += 1
+        else:
+            # execute synchronously
+            try:
+                (start, end) = self.emitter.emit(record)
+                write_callback.on_success(record_envelope, success_metadata={})
+            except Exception as e:
+                write_callback.on_failure(record_envelope, e, failure_metadata={})
 
     def close(self):
         self.executor.shutdown(wait=True)
@@ -213,4 +218,4 @@ class DatahubRestSink(Sink):
         return self.emitter.__repr__()
 
     def configured(self) -> str:
-        return self.__repr__()
+        return repr(self)

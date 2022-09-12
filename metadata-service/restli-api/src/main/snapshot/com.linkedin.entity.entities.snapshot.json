@@ -2807,6 +2807,16 @@
                             "fieldType" : "TEXT"
                           }
                         }, {
+                          "name" : "label",
+                          "type" : "string",
+                          "doc" : "Label of the field. Provides a more human-readable name for the field than field path. Some sources will\nprovide this metadata but not all sources have the concept of a label. If just one string is associated with\na field in a source, that is most likely a description.",
+                          "optional" : true,
+                          "Searchable" : {
+                            "boostScore" : 0.2,
+                            "fieldName" : "fieldLabels",
+                            "fieldType" : "TEXT"
+                          }
+                        }, {
                           "name" : "created",
                           "type" : "com.linkedin.common.AuditStamp",
                           "doc" : "An AuditStamp corresponding to the creation of this schema field.",
@@ -4830,6 +4840,20 @@
                         "type" : "boolean",
                         "doc" : "Whether the filter should apply to all groups.",
                         "default" : false
+                      }, {
+                        "name" : "roles",
+                        "type" : {
+                          "type" : "array",
+                          "items" : "com.linkedin.common.Urn"
+                        },
+                        "doc" : "A specific set of roles to apply the policy to (disjunctive).",
+                        "optional" : true,
+                        "Relationship" : {
+                          "/*" : {
+                            "entityTypes" : [ "dataHubRole" ],
+                            "name" : "IsAssociatedWithRole"
+                          }
+                        }
                       } ]
                     },
                     "doc" : "The actors that the policy applies to."
@@ -5304,6 +5328,10 @@
     }, {
       "name" : "rows",
       "type" : "long"
+    }, {
+      "name" : "timeseriesRows",
+      "type" : "long",
+      "optional" : true
     } ]
   }, {
     "type" : "record",
@@ -5677,9 +5705,26 @@
         "returns" : "com.linkedin.metadata.browse.BrowseResult"
       }, {
         "name" : "delete",
+        "doc" : "Deletes all data related to an individual urn(entity).\nService Returns: - a DeleteEntityResponse object.",
         "parameters" : [ {
           "name" : "urn",
-          "type" : "string"
+          "type" : "string",
+          "doc" : "- the urn of the entity."
+        }, {
+          "name" : "aspectName",
+          "type" : "string",
+          "optional" : true,
+          "doc" : "- the optional aspect name if only want to delete the aspect (applicable only for timeseries aspects)."
+        }, {
+          "name" : "startTimeMillis",
+          "type" : "long",
+          "optional" : true,
+          "doc" : "- the optional start time (applicable only for timeseries aspects)."
+        }, {
+          "name" : "endTimeMillis",
+          "type" : "long",
+          "optional" : true,
+          "doc" : "- the optional end time (applicable only for the timeseries aspects)."
         } ],
         "returns" : "com.linkedin.metadata.run.DeleteEntityResponse"
       }, {
